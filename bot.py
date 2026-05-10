@@ -36,7 +36,7 @@ config = load_config()
 GUILD_ID = int(config["guild_id"])
 AGENT_BASE_URL = config["agent"]["base_url"].rstrip("/")
 
-intents = discord.Intents(guilds=True)
+intents = discord.Intents(guilds=True, message_content = True)
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -129,8 +129,9 @@ def make_status_embed(server_status: dict[str, Any]) -> discord.Embed:
 @bot.event
 async def on_ready() -> None:
     guild = discord.Object(id=GUILD_ID)
-    bot.tree.copy_global_to(guild=guild)
-    await bot.tree.sync(guild=guild)
+
+    await bot.tree.sync(guild=guild)  # schnell im Server
+    await bot.tree.sync()  # global für DMs
 
     print(f"Logged in as {bot.user}")
 

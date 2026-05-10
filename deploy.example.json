@@ -1,0 +1,6 @@
+{
+  "remoteUser": "user",
+  "remoteHost": "host",
+  "remotePath": "/path/to/heimdall-bot",
+  "serviceName": "heimdall-bot"
+}
