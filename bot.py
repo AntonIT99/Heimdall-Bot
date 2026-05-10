@@ -3,11 +3,12 @@ import os
 import asyncio
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from wakeonlan import send_magic_packet
 
@@ -15,6 +16,7 @@ from wakeonlan import send_magic_packet
 load_dotenv()
 
 CONFIG_PATH = Path("config.json")
+STATE_PATH = Path("state.json")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 AGENT_TOKEN = os.getenv("HEIMDALL_AGENT_TOKEN")
@@ -31,13 +33,32 @@ def load_config() -> dict[str, Any]:
         return json.load(file)
 
 
+def load_state() -> dict[str, Any]:
+    if not STATE_PATH.exists():
+        return {
+            "active_instance": None,
+            "dashboard_message_id": None,
+            "last_status_signature": None,
+        }
+
+    with STATE_PATH.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def save_state() -> None:
+    with STATE_PATH.open("w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2)
+
+
 config = load_config()
+state = load_state()
 
 GUILD_ID = int(config["guild_id"])
 AGENT_BASE_URL = config["agent"]["base_url"].rstrip("/")
+DASHBOARD_CHANNEL_ID = int(config["dashboard"]["channel_id"])
+DASHBOARD_INTERVAL = int(config["dashboard"].get("update_interval_seconds", 30))
 
-intents = discord.Intents(guilds=True, message_content = True)
-
+intents = discord.Intents(guilds=True, message_content=True)
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -106,32 +127,201 @@ async def wait_for_agent() -> bool:
     return False
 
 
-def make_status_embed(server_status: dict[str, Any]) -> discord.Embed:
-    minecraft_online = server_status.get("minecraft_online", False)
-    rcon_online = server_status.get("rcon_online", False)
+async def get_full_status() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "agent_online": False,
+        "minecraft_online": False,
+        "rcon_online": False,
+        "players_response": None,
+        "active_instance": state.get("active_instance"),
+        "error": None,
+    }
 
-    if minecraft_online:
+    try:
+        status_data = await agent_request("GET", "/status", timeout_seconds=5)
+        result.update(status_data)
+        result["agent_online"] = True
+
+        if status_data.get("rcon_online"):
+            try:
+                players_data = await agent_request("GET", "/players", timeout_seconds=5)
+                result["players_response"] = players_data.get("response")
+            except Exception as error:
+                result["players_response"] = f"Could not query players: {error}"
+
+        if not status_data.get("minecraft_online"):
+            result["active_instance"] = None
+            if state.get("active_instance") is not None:
+                state["active_instance"] = None
+                save_state()
+
+    except Exception as error:
+        result["error"] = str(error)
+
+    return result
+
+
+def get_status_signature(status_data: dict[str, Any]) -> str:
+    relevant = {
+        "agent_online": status_data.get("agent_online"),
+        "minecraft_online": status_data.get("minecraft_online"),
+        "rcon_online": status_data.get("rcon_online"),
+        "players_response": status_data.get("players_response"),
+        "active_instance": status_data.get("active_instance"),
+        "error": status_data.get("error"),
+    }
+
+    return json.dumps(relevant, sort_keys=True)
+
+
+def get_player_text(players_response: str | None) -> str:
+    if not players_response:
+        return "Unknown"
+
+    cleaned = players_response.strip()
+    return cleaned if cleaned else "No player data"
+
+
+def make_status_embed(status_data: dict[str, Any], dashboard: bool = False) -> discord.Embed:
+    agent_online = status_data.get("agent_online", False)
+    minecraft_online = status_data.get("minecraft_online", False)
+    rcon_online = status_data.get("rcon_online", False)
+    active_instance = status_data.get("active_instance")
+
+    if not agent_online:
+        title = "🔴 Heimdall Agent Offline"
+        color = discord.Color.dark_red()
+        description = "The Windows host agent is currently unreachable."
+    elif minecraft_online:
         title = "🟢 Minecraft Server Online"
         color = discord.Color.green()
+        description = "The Minecraft server is currently running."
     else:
-        title = "🔴 Minecraft Server Offline"
-        color = discord.Color.red()
+        title = "⚫ Minecraft Server Offline"
+        color = discord.Color.dark_grey()
+        description = "No Minecraft server is currently running."
 
-    embed = discord.Embed(title=title, color=color)
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color,
+    )
+
+    embed.add_field(name="Agent", value="Online" if agent_online else "Offline", inline=True)
     embed.add_field(name="Minecraft", value="Online" if minecraft_online else "Offline", inline=True)
     embed.add_field(name="RCON", value="Online" if rcon_online else "Offline", inline=True)
-    embed.add_field(name="Server Port", value=str(server_status.get("server_port")), inline=True)
-    embed.add_field(name="RCON Port", value=str(server_status.get("rcon_port")), inline=True)
+
+    embed.add_field(
+        name="Active Instance",
+        value=f"`{active_instance}`" if active_instance else "None",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Server Port",
+        value=str(status_data.get("server_port", "Unknown")),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="RCON Port",
+        value=str(status_data.get("rcon_port", "Unknown")),
+        inline=True,
+    )
+
+    if minecraft_online:
+        embed.add_field(
+            name="Players",
+            value=f"`{get_player_text(status_data.get('players_response'))}`",
+            inline=False,
+        )
+
+    if status_data.get("error"):
+        embed.add_field(
+            name="Error",
+            value=f"`{status_data['error']}`",
+            inline=False,
+        )
+
+    if dashboard:
+        embed.set_footer(text="Heimdall Dashboard • Updates only when status changes")
+    else:
+        embed.set_footer(text="Heimdall Bot")
 
     return embed
+
+
+async def update_presence(status_data: dict[str, Any]) -> None:
+    agent_online = status_data.get("agent_online", False)
+    minecraft_online = status_data.get("minecraft_online", False)
+    active_instance = status_data.get("active_instance")
+
+    if not agent_online:
+        activity = discord.Activity(type=discord.ActivityType.watching, name="Agent offline")
+        await bot.change_presence(status=discord.Status.dnd, activity=activity)
+    elif minecraft_online:
+        name = active_instance if active_instance else "Minecraft online"
+        activity = discord.Activity(type=discord.ActivityType.watching, name=name)
+        await bot.change_presence(status=discord.Status.online, activity=activity)
+    else:
+        activity = discord.Activity(type=discord.ActivityType.watching, name="Minecraft offline")
+        await bot.change_presence(status=discord.Status.idle, activity=activity)
+
+
+async def get_dashboard_message(channel: discord.TextChannel) -> discord.Message | None:
+    message_id = state.get("dashboard_message_id")
+
+    if not message_id:
+        return None
+
+    try:
+        return await channel.fetch_message(int(message_id))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+@tasks.loop(seconds=DASHBOARD_INTERVAL)
+async def dashboard_loop() -> None:
+    await bot.wait_until_ready()
+
+    channel = bot.get_channel(DASHBOARD_CHANNEL_ID)
+
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    status_data = await get_full_status()
+    signature = get_status_signature(status_data)
+
+    if signature == state.get("last_status_signature"):
+        return
+
+    embed = make_status_embed(status_data, dashboard=True)
+    message = await get_dashboard_message(channel)
+
+    if message is None:
+        message = await channel.send(embed=embed)
+        state["dashboard_message_id"] = message.id
+    else:
+        await message.edit(embed=embed)
+
+    state["last_status_signature"] = signature
+    save_state()
+
+    await update_presence(status_data)
 
 
 @bot.event
 async def on_ready() -> None:
     guild = discord.Object(id=GUILD_ID)
 
-    await bot.tree.sync(guild=guild)  # schnell im Server
-    await bot.tree.sync()  # global für DMs
+    await bot.tree.sync(guild=guild)
+    await bot.tree.sync()
+
+    if not dashboard_loop.is_running():
+        dashboard_loop.start()
+
+    status_data = await get_full_status()
+    await update_presence(status_data)
 
     print(f"Logged in as {bot.user}")
 
@@ -141,7 +331,7 @@ async def status(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=False)
 
     try:
-        data = await agent_request("GET", "/status")
+        data = await get_full_status()
         await interaction.followup.send(embed=make_status_embed(data))
     except Exception as error:
         await interaction.followup.send(f"❌ Could not reach Heimdall Agent:\n`{error}`")
@@ -159,8 +349,19 @@ async def instances(interaction: discord.Interaction) -> None:
             await interaction.followup.send("No instances configured.")
             return
 
-        text = "\n".join(f"- `{item['id']}` — {item['name']}" for item in items)
-        await interaction.followup.send(f"🎮 Available instances:\n{text}")
+        embed = discord.Embed(
+            title="🎮 Available Minecraft Instances",
+            color=discord.Color.blurple(),
+        )
+
+        for item in items:
+            embed.add_field(
+                name=item["name"],
+                value=f"`{item['id']}`",
+                inline=False,
+            )
+
+        await interaction.followup.send(embed=embed)
 
     except Exception as error:
         await interaction.followup.send(f"❌ Could not load instances:\n`{error}`")
@@ -211,7 +412,14 @@ async def start_server(interaction: discord.Interaction, instance: str) -> None:
 
     try:
         result = await agent_request("POST", "/start", {"instance": instance})
+        state["active_instance"] = instance
+        save_state()
+
         await interaction.followup.send(f"🟢 {result.get('message', 'Start command sent')}")
+
+        status_data = await get_full_status()
+        await update_presence(status_data)
+
     except Exception as error:
         await interaction.followup.send(f"❌ Could not start server:\n`{error}`")
 
@@ -234,6 +442,13 @@ async def stop_server(interaction: discord.Interaction, shutdown_after: bool = F
 
         await interaction.followup.send(msg)
 
+        state["active_instance"] = None
+        save_state()
+
+        await asyncio.sleep(3)
+        status_data = await get_full_status()
+        await update_presence(status_data)
+
     except Exception as error:
         await interaction.followup.send(f"❌ Could not stop server:\n`{error}`")
 
@@ -244,7 +459,13 @@ async def players(interaction: discord.Interaction) -> None:
 
     try:
         data = await agent_request("GET", "/players")
-        await interaction.followup.send(f"👥 `{data.get('response', '').strip()}`")
+        response = data.get("response", "").strip()
+        embed = discord.Embed(
+            title="👥 Minecraft Players",
+            description=f"`{response}`" if response else "No player data.",
+            color=discord.Color.blurple(),
+        )
+        await interaction.followup.send(embed=embed)
     except Exception as error:
         await interaction.followup.send(f"❌ Could not query players:\n`{error}`")
 
@@ -259,7 +480,8 @@ async def say(interaction: discord.Interaction, message: str) -> None:
     await interaction.response.defer(ephemeral=True)
 
     try:
-        await agent_request("POST", f"/say?message={message}")
+        encoded_message = quote(message)
+        await agent_request("POST", f"/say?message={encoded_message}")
         await interaction.followup.send("✅ Message sent.")
     except Exception as error:
         await interaction.followup.send(f"❌ Could not send message:\n`{error}`")

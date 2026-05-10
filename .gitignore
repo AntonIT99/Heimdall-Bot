@@ -17,3 +17,4 @@ config.json
 Thumbs.db
 
 deploy.local.json
+state.json
