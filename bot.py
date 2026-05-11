@@ -43,6 +43,7 @@ def load_state() -> dict[str, Any]:
             "last_status_signature": None,
             "instances_dashboard_message_id": None,
             "last_instances_signature": None,
+            "last_instances_data": {"instances": []},
             "empty_since": None,
         }
 
@@ -421,15 +422,29 @@ async def get_dashboard_message(channel: discord.TextChannel) -> discord.Message
 
 def make_instances_embed(instances_data: dict[str, Any]) -> discord.Embed:
     items = instances_data.get("instances", [])
+    agent_online = instances_data.get("agent_online", True)
 
     embed = discord.Embed(
         title="🎮 Minecraft Server Instances",
         description="Currently configured Minecraft server instances.",
-        color=discord.Color.blurple(),
+        color=discord.Color.blurple() if agent_online else discord.Color.dark_red(),
     )
 
+    if not agent_online:
+        embed.add_field(
+            name="Agent",
+            value="Offline - showing last known instances.",
+            inline=False,
+        )
+
     if not items:
-        embed.add_field(name="No instances", value="No Minecraft instances are configured.", inline=False)
+        value = (
+            "No Minecraft instances are configured."
+            if agent_online
+            else "No cached instance list is available yet."
+        )
+        embed.add_field(name="No instances", value=value, inline=False)
+        embed.set_footer(text="Heimdall Instances Dashboard • Updates only when instances change")
         return embed
 
     active_instance = state.get("active_instance")
@@ -506,11 +521,17 @@ async def instances_dashboard_loop() -> None:
 
     try:
         instances_data = await agent_request("GET", "/instances", timeout_seconds=5)
+        instances_data["agent_online"] = True
+        state["last_instances_data"] = {
+            "instances": instances_data.get("instances", []),
+        }
     except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
-        instances_data = {"instances": []}
+        instances_data = dict(state.get("last_instances_data") or {"instances": []})
+        instances_data["agent_online"] = False
 
     signature_payload = {
         "instances": instances_data.get("instances", []),
+        "agent_online": instances_data.get("agent_online", True),
         "active_instance": state.get("active_instance"),
     }
 
