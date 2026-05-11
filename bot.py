@@ -35,20 +35,33 @@ def load_config() -> dict[str, Any]:
         return json.load(file)
 
 
+def default_state() -> dict[str, Any]:
+    return {
+        "active_instance": None,
+        "dashboard_message_id": None,
+        "last_status_signature": None,
+        "instances_dashboard_message_id": None,
+        "last_instances_signature": None,
+        "last_instances_data": {"instances": []},
+        "empty_since": None,
+        "subscriber_user_ids": [],
+        "last_minecraft_online": None,
+    }
+
+
 def load_state() -> dict[str, Any]:
+    defaults = default_state()
+
     if not STATE_PATH.exists():
-        return {
-            "active_instance": None,
-            "dashboard_message_id": None,
-            "last_status_signature": None,
-            "instances_dashboard_message_id": None,
-            "last_instances_signature": None,
-            "last_instances_data": {"instances": []},
-            "empty_since": None,
-        }
+        return defaults
 
     with STATE_PATH.open("r", encoding="utf-8") as file:
-        return json.load(file)
+        loaded_state = json.load(file)
+
+    for key, value in defaults.items():
+        loaded_state.setdefault(key, value)
+
+    return loaded_state
 
 
 def save_state() -> None:
@@ -303,6 +316,64 @@ def get_player_text(players_response: str | None) -> str:
     return cleaned if cleaned else "No player data"
 
 
+def get_subscriber_user_ids() -> list[int]:
+    subscriber_ids = state.get("subscriber_user_ids", [])
+
+    if not isinstance(subscriber_ids, list):
+        return []
+
+    result = []
+
+    for user_id in subscriber_ids:
+        try:
+            result.append(int(user_id))
+        except (TypeError, ValueError):
+            continue
+
+    return result
+
+
+async def notify_subscribers_server_online(status_data: dict[str, Any]) -> None:
+    subscriber_ids = get_subscriber_user_ids()
+
+    if not subscriber_ids:
+        return
+
+    active_instance = status_data.get("active_instance") or state.get("active_instance") or "unknown"
+    player_text = get_player_text(status_data.get("players_response"))
+
+    embed = discord.Embed(
+        title="Minecraft Server Online",
+        description=f"Instance `{active_instance}` is now running.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Players", value=f"`{player_text}`", inline=False)
+    embed.set_footer(text="Use /unsubscribe to stop these notifications.")
+
+    for user_id in subscriber_ids:
+        try:
+            user = bot.get_user(user_id)
+
+            if user is None:
+                user = await bot.fetch_user(user_id)
+
+            await user.send(embed=embed)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            continue
+
+
+async def handle_minecraft_online_transition(status_data: dict[str, Any]) -> None:
+    minecraft_online = bool(status_data.get("minecraft_online"))
+    last_minecraft_online = state.get("last_minecraft_online")
+
+    if last_minecraft_online != minecraft_online:
+        state["last_minecraft_online"] = minecraft_online
+        save_state()
+
+    if last_minecraft_online is False and minecraft_online:
+        await notify_subscribers_server_online(status_data)
+
+
 def make_truncated_code_block(text: str | None, empty_message: str = "No output.") -> str:
     if not text or not text.strip():
         return f"```{empty_message}```"
@@ -484,15 +555,17 @@ async def get_instances_dashboard_message(channel: discord.TextChannel) -> disco
 async def dashboard_loop() -> None:
     await bot.wait_until_ready()
 
-    channel = bot.get_channel(DASHBOARD_CHANNEL_ID)
-
-    if not isinstance(channel, discord.TextChannel):
-        return
-
     status_data = await get_full_status()
+    await handle_minecraft_online_transition(status_data)
+
     signature = get_status_signature(status_data)
 
     if signature == state.get("last_status_signature"):
+        return
+
+    channel = bot.get_channel(DASHBOARD_CHANNEL_ID)
+
+    if not isinstance(channel, discord.TextChannel):
         return
 
     embed = make_status_embed(status_data, dashboard=True)
@@ -663,6 +736,49 @@ async def instances(interaction: discord.Interaction) -> None:
 
     except Exception as error:
         await interaction.followup.send(f"❌ Could not load instances:\n`{error}`")
+
+
+@bot.tree.command(name="subscribe", description="Get a DM when the Minecraft server comes online.")
+async def subscribe(interaction: discord.Interaction) -> None:
+    user_id = int(interaction.user.id)
+    subscriber_ids = get_subscriber_user_ids()
+
+    if user_id in subscriber_ids:
+        await interaction.response.send_message(
+            "You are already subscribed to server online notifications.",
+            ephemeral=True,
+        )
+        return
+
+    subscriber_ids.append(user_id)
+    state["subscriber_user_ids"] = subscriber_ids
+    save_state()
+
+    await interaction.response.send_message(
+        "Subscribed. I will DM you when the Minecraft server comes online.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="unsubscribe", description="Stop DM notifications when the Minecraft server comes online.")
+async def unsubscribe(interaction: discord.Interaction) -> None:
+    user_id = int(interaction.user.id)
+    subscriber_ids = get_subscriber_user_ids()
+
+    if user_id not in subscriber_ids:
+        await interaction.response.send_message(
+            "You are not subscribed to server online notifications.",
+            ephemeral=True,
+        )
+        return
+
+    state["subscriber_user_ids"] = [subscriber_id for subscriber_id in subscriber_ids if subscriber_id != user_id]
+    save_state()
+
+    await interaction.response.send_message(
+        "Unsubscribed. I will no longer DM you when the Minecraft server comes online.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="wake-host", description="Wakes the Minecraft host PC using Wake-on-LAN.")

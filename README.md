@@ -11,6 +11,7 @@ Heimdall Bot runs on a Raspberry Pi and controls a Windows-based Minecraft host 
 - Start configured Minecraft instances
 - Stop Minecraft cleanly through Heimdall Agent
 - Query online players
+- Subscribe to server online DM notifications
 - Send Minecraft chat messages through RCON
 - Wake-on-LAN support
 - Optional Windows host shutdown
@@ -206,6 +207,10 @@ journalctl -u heimdall-bot -f
 - `/status`
 - `/instances`
 - `/players`
+- `/subscribe`
+- `/unsubscribe`
+- `/request-start`
+- `/request-stop`
 
 ### Admin Commands
 
@@ -213,6 +218,8 @@ journalctl -u heimdall-bot -f
 - `/start-server`
 - `/stop-server`
 - `/say`
+- `/rcon`
+- `/logs`
 
 ### Owner Commands
 
