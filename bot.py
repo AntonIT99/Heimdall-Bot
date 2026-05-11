@@ -60,6 +60,7 @@ state = load_state()
 
 GUILD_ID = int(config["guild_id"])
 AGENT_BASE_URL = config["agent"]["base_url"].rstrip("/")
+AGENT_STOP_PATH = "/stop"
 DASHBOARD_CHANNEL_ID = int(config["dashboard"]["channel_id"])
 DASHBOARD_INTERVAL = int(config["dashboard"].get("update_interval_seconds", 30))
 INSTANCES_DASHBOARD_CHANNEL_ID = int(config["instances_dashboard"]["channel_id"])
@@ -191,7 +192,7 @@ async def stop_current_server_if_needed() -> None:
     if not status_data.get("minecraft_online"):
         return
 
-    await agent_request("POST", "/stop", {"shutdown_after": False}, timeout_seconds=20)
+    await agent_request("POST", AGENT_STOP_PATH, {"shutdown_after": False}, timeout_seconds=20)
 
     for _ in range(24):
         await asyncio.sleep(5)
@@ -257,6 +258,10 @@ async def get_full_status() -> dict[str, Any]:
         result.update(status_data)
         result["agent_online"] = True
 
+        if status_data.get("minecraft_online") and status_data.get("active_instance") != state.get("active_instance"):
+            state["active_instance"] = status_data.get("active_instance")
+            save_state()
+
         if status_data.get("rcon_online"):
             try:
                 players_data = await agent_request("GET", "/players", timeout_seconds=5)
@@ -295,6 +300,22 @@ def get_player_text(players_response: str | None) -> str:
 
     cleaned = players_response.strip()
     return cleaned if cleaned else "No player data"
+
+
+def make_truncated_code_block(text: str | None, empty_message: str = "No output.") -> str:
+    if not text or not text.strip():
+        return f"```{empty_message}```"
+
+    cleaned = text.replace("```", "` ` `").strip()
+    truncated_notice = "\n... output truncated."
+    wrapper_length = len("```") + len("```")
+    max_content_chars = 2000 - wrapper_length
+
+    if len(cleaned) > max_content_chars:
+        trimmed_length = max_content_chars - len(truncated_notice)
+        cleaned = f"{cleaned[:trimmed_length]}{truncated_notice}"
+
+    return f"```{cleaned}```"
 
 
 def make_status_embed(status_data: dict[str, Any], dashboard: bool = False) -> discord.Embed:
@@ -550,7 +571,7 @@ async def idle_shutdown_loop() -> None:
     idle_seconds = int(idle_config.get("idle_seconds", 3600))
 
     if now - float(state["empty_since"]) >= idle_seconds:
-        await agent_request("POST", "/stop", {"shutdown_after": False}, timeout_seconds=20)
+        await agent_request("POST", AGENT_STOP_PATH, {"shutdown_after": False}, timeout_seconds=20)
 
         state["active_instance"] = None
         state["empty_since"] = None
@@ -690,7 +711,7 @@ async def stop_server(interaction: discord.Interaction, shutdown_after: bool = F
     await interaction.response.defer(ephemeral=False)
 
     try:
-        result = await agent_request("POST", "/stop", {"shutdown_after": shutdown_after})
+        result = await agent_request("POST", AGENT_STOP_PATH, {"shutdown_after": shutdown_after})
         msg = "🔴 Minecraft stop command sent."
 
         if result.get("shutdown_after"):
@@ -741,6 +762,48 @@ async def say(interaction: discord.Interaction, message: str) -> None:
         await interaction.followup.send("✅ Message sent.")
     except Exception as error:
         await interaction.followup.send(f"❌ Could not send message:\n`{error}`")
+
+
+@bot.tree.command(name="rcon", description="Runs an RCON command on the Minecraft server.")
+@app_commands.describe(command="Minecraft command to run")
+async def rcon(interaction: discord.Interaction, command: str) -> None:
+    if not is_admin(interaction):
+        await interaction.response.send_message("You are not allowed to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        data = await agent_request("POST", "/rcon", {"command": command}, timeout_seconds=10)
+        response = data.get("response", "")
+
+        if not response or not response.strip():
+            await interaction.followup.send("Command executed. No response.", ephemeral=True)
+            return
+
+        await interaction.followup.send(make_truncated_code_block(response), ephemeral=True)
+    except Exception as error:
+        await interaction.followup.send(f"Could not run RCON command:\n`{error}`", ephemeral=True)
+
+
+@bot.tree.command(name="logs", description="Shows recent Minecraft server log lines.")
+@app_commands.describe(lines="Number of lines to show, from 1 to 200")
+async def logs(interaction: discord.Interaction, lines: int = 50) -> None:
+    if not is_admin(interaction):
+        await interaction.response.send_message("You are not allowed to view server logs.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        requested_lines = max(1, min(lines, 200))
+        data = await agent_request("GET", f"/logs?lines={requested_lines}", timeout_seconds=10)
+        await interaction.followup.send(
+            make_truncated_code_block(data.get("log", ""), empty_message="No log output."),
+            ephemeral=True,
+        )
+    except Exception as error:
+        await interaction.followup.send(f"Could not load logs:\n`{error}`", ephemeral=True)
 
 
 @bot.tree.command(name="shutdown-host", description="Shuts down the Windows Minecraft host.")
@@ -857,7 +920,7 @@ async def request_stop(interaction: discord.Interaction) -> None:
 
         await owner.send("✅ Stop request accepted. Stopping server...")
 
-        await agent_request("POST", "/stop", {"shutdown_after": False}, timeout_seconds=20)
+        await agent_request("POST", AGENT_STOP_PATH, {"shutdown_after": False}, timeout_seconds=20)
 
         state["active_instance"] = None
         state["empty_since"] = None
