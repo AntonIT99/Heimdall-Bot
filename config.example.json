@@ -23,5 +23,17 @@
   "dashboard": {
     "channel_id": 123456789012345678,
     "update_interval_seconds": 30
+  },
+  "instances_dashboard": {
+    "channel_id": 123456789012345678,
+    "update_interval_seconds": 300
+  },
+  "requests": {
+    "owner_accept_timeout_seconds": 1800
+  },
+  "idle_shutdown": {
+    "enabled": true,
+    "idle_seconds": 3600,
+    "check_interval_seconds": 60
   }
 }
